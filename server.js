@@ -29,6 +29,39 @@ async function copperFetch(path, { method = "GET", body } = {}) {
   return res.json();
 }
 
+// --- Name Resolution Cache (per-request, reset each call) ---
+async function resolveParentName(type, id, cache) {
+  const key = `${type}:${id}`;
+  if (cache.has(key)) return cache.get(key);
+
+  const endpoints = {
+    person: `/people/${id}`,
+    company: `/companies/${id}`,
+    lead: `/leads/${id}`,
+    opportunity: `/opportunities/${id}`,
+  };
+
+  const endpoint = endpoints[type];
+  if (!endpoint) {
+    const fallback = `${type} #${id}`;
+    cache.set(key, fallback);
+    return fallback;
+  }
+
+  try {
+    const record = await copperFetch(endpoint);
+    const name = record.name || record.first_name
+      ? [record.first_name, record.last_name].filter(Boolean).join(" ") || record.name
+      : `${type} #${id}`;
+    cache.set(key, name);
+    return name;
+  } catch {
+    const fallback = `${type} #${id}`;
+    cache.set(key, fallback);
+    return fallback;
+  }
+}
+
 function jsonResult(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
@@ -88,6 +121,42 @@ server.tool(
   async ({ person_id }) => {
     const person = await copperFetch(`/people/${person_id}`);
     return jsonResult(person);
+  }
+);
+
+// --- Tool 2b: Create Person ---
+server.tool(
+  "create_person",
+  "Create a new person (contact) in Copper CRM.",
+  {
+    first_name: z.string().describe("First name"),
+    last_name: z.string().describe("Last name"),
+    title: z.string().optional().describe("Job title"),
+    company_name: z.string().optional().describe("Company name (Copper auto-links or creates)"),
+    emails: z.array(z.object({
+      email: z.string(),
+      category: z.enum(["work", "personal", "other"]).optional()
+    })).optional().describe("Email addresses"),
+    phone_numbers: z.array(z.object({
+      number: z.string(),
+      category: z.enum(["work", "mobile", "home", "other"]).optional()
+    })).optional().describe("Phone numbers"),
+    tags: z.array(z.string()).optional().describe("Tags for categorization"),
+    contact_type_id: z.number().optional().describe("Contact type ID (e.g. Potential Customer)"),
+  },
+  async ({ first_name, last_name, title, company_name, emails, phone_numbers, tags, contact_type_id }) => {
+    const body = { name: `${first_name} ${last_name}` };
+    if (first_name) body.first_name = first_name;
+    if (last_name) body.last_name = last_name;
+    if (title) body.title = title;
+    if (company_name) body.company_name = company_name;
+    if (emails) body.emails = emails;
+    if (phone_numbers) body.phone_numbers = phone_numbers;
+    if (tags) body.tags = tags;
+    if (contact_type_id) body.contact_type_id = contact_type_id;
+
+    const result = await copperFetch("/people", { method: "POST", body });
+    return jsonResult(result);
   }
 );
 
@@ -193,6 +262,62 @@ server.tool(
       win_probability: o.win_probability,
     }));
     return jsonResult(opps);
+  }
+);
+
+// --- Tool 7: List/Search Activities ---
+server.tool(
+  "list_activities",
+  "Search Copper activities (meeting notes, calls, emails logged against contacts). Filter by parent record, activity type, or date range. Returns resolved parent names. Excludes system activities (assignee/status changes) by default.",
+  {
+    parent_type: z.enum(["person", "company", "lead", "opportunity", "project", "task"]).optional().describe("Filter by parent entity type"),
+    parent_id: z.number().optional().describe("Filter by parent entity ID (requires parent_type)"),
+    minimum_activity_date: z.number().optional().describe("Unix timestamp — only activities on or after this date"),
+    maximum_activity_date: z.number().optional().describe("Unix timestamp — only activities on or before this date"),
+    include_system: z.boolean().optional().describe("Include system activities like assignee/status changes (default: false)"),
+    page_size: z.number().optional().describe("Results per page (default 20, max 200)"),
+    page_number: z.number().optional().describe("Page number (default 1)"),
+  },
+  async ({ parent_type, parent_id, minimum_activity_date, maximum_activity_date, include_system, page_size, page_number }) => {
+    const body = {};
+    if (parent_type && parent_id) body.parent = { id: parent_id, type: parent_type };
+    if (minimum_activity_date) body.minimum_activity_date = minimum_activity_date;
+    if (maximum_activity_date) body.maximum_activity_date = maximum_activity_date;
+    body.page_size = page_size || 200;
+    body.page_number = page_number || 1;
+
+    const results = await copperFetch("/activities/search", { method: "POST", body });
+
+    // Filter out system activities unless explicitly requested
+    const filtered = include_system
+      ? results
+      : results.filter((a) => a.type?.category === "user");
+
+    // Resolve parent names
+    const nameCache = new Map();
+    const activities = await Promise.all(
+      filtered.map(async (a) => {
+        const parentType = a.parent?.type;
+        const parentId = a.parent?.id;
+        const parent_name = parentType && parentId
+          ? await resolveParentName(parentType, parentId, nameCache)
+          : null;
+
+        return {
+          id: a.id,
+          parent: a.parent,
+          parent_name,
+          type: a.type,
+          user_id: a.user_id,
+          details: a.details,
+          activity_date: a.activity_date,
+          date_created: a.date_created,
+          date_modified: a.date_modified,
+        };
+      })
+    );
+
+    return jsonResult(activities);
   }
 );
 
