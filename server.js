@@ -5,8 +5,9 @@ import { z } from "zod";
 // --- Config ---
 const API_KEY = process.env.COPPER_API_KEY;
 const USER_EMAIL = process.env.COPPER_USER_EMAIL;
-if (!API_KEY || !USER_EMAIL) {
-  console.error("COPPER_API_KEY and COPPER_USER_EMAIL environment variables are required");
+const USER_ID = process.env.COPPER_USER_ID;
+if (!API_KEY || !USER_EMAIL || !USER_ID) {
+  console.error("COPPER_API_KEY, COPPER_USER_EMAIL, and COPPER_USER_ID environment variables are required");
   process.exit(1);
 }
 
@@ -160,6 +161,33 @@ server.tool(
   }
 );
 
+// --- Tool 2c: Update Person ---
+server.tool(
+  "update_person",
+  "Update an existing person (contact) in Copper CRM. Only include fields you want to change. The 'details' field is the 'About' section visible at the top of the contact page.",
+  {
+    person_id: z.number().describe("Copper person ID to update"),
+    details: z.string().optional().describe("About/details text (visible at top of contact page in Copper UI)"),
+    title: z.string().optional().describe("Job title"),
+    tags: z.array(z.string()).optional().describe("Tags (replaces existing tags)"),
+  },
+  async ({ person_id, details, title, tags }) => {
+    const body = {};
+    if (details !== undefined) body.details = details;
+    if (title !== undefined) body.title = title;
+    if (tags !== undefined) body.tags = tags;
+
+    const result = await copperFetch(`/people/${person_id}`, { method: "PUT", body });
+    return jsonResult({
+      id: result.id,
+      name: result.name,
+      details: result.details,
+      title: result.title,
+      tags: result.tags,
+    });
+  }
+);
+
 // --- Tool 3: Search Companies ---
 server.tool(
   "search_companies",
@@ -207,13 +235,14 @@ server.tool(
     parent_type: z.enum(["person", "company"]).describe("Type of record to log against"),
     parent_id: z.number().describe("Copper ID of the person or company"),
     activity_type_id: z.number().describe("Activity type ID (from list_activity_types)"),
-    details: z.string().describe("Activity content — meeting notes, action items, summary, etc."),
+    details: z.string().describe("Activity content — meeting notes, action items, summary, etc. Use plain text, not markdown."),
     activity_date: z.number().optional().describe("Unix timestamp for when the activity occurred (default: now)"),
   },
   async ({ parent_type, parent_id, activity_type_id, details, activity_date }) => {
     const body = {
       parent: { type: parent_type, id: parent_id },
       type: { id: activity_type_id, category: "user" },
+      user_id: parseInt(USER_ID),
       details,
     };
     if (activity_date) body.activity_date = activity_date;
